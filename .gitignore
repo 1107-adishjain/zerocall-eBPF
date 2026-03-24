@@ -1,0 +1,14 @@
+.env
+.env.*
+
+# Vagrant local state
+.vagrant/
+
+# Build and generated artifacts
+*.o
+*.tmp
+*.log
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
