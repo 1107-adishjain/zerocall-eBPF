@@ -135,3 +135,66 @@ Expected Results:
 2. In the Trace Pipe Terminal: You will see the eBPF data plane's real-time interception log: bpf_trace_printk: [SECURITY BLOCK] Malicious clone() detected! Flags: 30000011.
 
 This proves the kernel identified the malicious namespace flags in the CPU registers and issued a SIGKILL (Signal 9) in $O(1)$ time before the system call could be executed.
+
+
+## Phase 2: Application Profiling and $S_{static}$ Extraction
+
+With the eBPF Data Plane successfully intercepting system calls, the next phase is to autonomously generate the whitelist of allowed capabilities. We calculate the final enforcement profile using the union of static and dynamic analysis: $S_{final} = (S_{static} \cup S_{dynamic}) - S_{blocked}$.
+
+The following steps detail how to extract $S_{static}$ using Symbolic Execution, which mathematically proves a binary's capabilities and defeats standard malware obfuscation techniques that trick simple disassemblers like objdump.
+
+### 13. Provision the Analysis Environment
+
+We utilize the angr framework for symbolic execution. Inside your Vagrant VM, install the required Python environment and analysis libraries:
+
+Bash:
+
+```bash
+sudo apt-get update
+sudo apt-get install -y python3-pip python3-dev build-essential
+pip3 install angr capstone
+```
+
+Note: During installation, Ubuntu may present a purple needrestart screen asking to restart daemons. Simply press Tab to select <Ok> and press Enter to bypass it safely.
+
+### 14. The Symbolic Execution Engine (static_profiler.py)
+
+To map the system calls, we built a Python-based profiling engine. Instead of just reading the binary's headers, this script uses angr's Simulation Manager (simgr) to mathematically walk through the executable's Control Flow Graph (CFG) from its entry point. It places a "tripwire" (hook) right before any hardware syscall instruction executes, pauses the simulation, and evaluates the rax register to definitively extract the system call ID.
+
+(The full implementation is available in the static_profiler.py file in the code repository).
+
+### 15. The Bare-Metal Exploit Payload (pure_exploit.c)
+
+To rigorously test the profiler, we avoid standard applications that import libc (which causes state explosion during static analysis due to its massive size). Instead, we created a specialized "Swiss Army Knife" payload. This binary utilizes raw inline assembly to trigger 35 distinct system calls—including file I/O, network sockets, privilege escalation, and container namespace escapes—completely bypassing standard library imports to simulate a highly evasive attack.
+
+(The full C source code for this payload is available in the pure_exploit.c file in the code repository).
+
+### 16. Compile the Payload (Avoiding State Explosion)
+
+Compile the test payload. It is critical to use the -nostdlib flag. This strips out the C Standard Library, leaving only our bare-metal assembly instructions, which allows the symbolic execution engine to analyze the binary in milliseconds rather than hours.
+
+Bash:
+
+```bash
+gcc -nostdlib pure_exploit.c -o pure_exploit
+```
+
+### 17. Execute the $S_{static}$ Profiler
+
+Run the static profiling engine against the compiled payload:
+
+Bash:
+
+```bash
+python3 static_profiler.py ./pure_exploit
+```
+
+Expected Results:
+
+The terminal will display the engine symbolically executing the binary and triggering the tripwire for every hidden system call it uncovers. At the conclusion of the run, it will output a successfully extracted profile:
+
+Total Unique Syscalls: 35
+
+Mathematical Set: {0, 1, 2, 3, 8, 9, 10, 11, 12, 39, 41, 42, 43, 44, 45, 49, 50, 56, 57, 59, 60, 62, 83, 84, 87, 90, 92, 101, 102, 104, 105, 106, 165, 272, 321}
+
+This explicitly proves that the symbolic execution architecture can accurately detect obfuscated, bare-metal capability requests that standard container security scanners routinely miss.
