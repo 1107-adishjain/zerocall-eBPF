@@ -79,9 +79,7 @@ clang -O2 -g -target bpf -D__TARGET_ARCH_x86 -c zerocall.bpf.c -o zerocall.bpf.o
 ```
 
 ### 7. Initialize the Go Control Plane
-The Control Plane acts as the "brain," responsible for loading the compiled eBPF object into the kernel, generating the zero-trust policy, and populating the BPF Hash Map. We use the cilium/ebpf library to manage this.
-
-Initialize the module and download the dependencies:
+The Control Plane acts as the "brain," responsible for loading the compiled eBPF object into the kernel, generating the zero-trust policy, and populating the BPF Hash Map.
 
 Bash:
 
@@ -90,13 +88,13 @@ go mod init zerocall
 go get github.com/cilium/ebpf
 ```
 
-Troubleshooting Note: Go Version Mismatches
-During development, you may encounter an error like go: go.mod file indicates go 1.2x, but maximum version supported by tidy is 1.18. This occurs if your host machine uses a newer Go version than the Ubuntu Vagrant VM.
+Troubleshooting Note: If you encounter a Go version mismatch, explicitly downgrade the version requirement in your go.mod file to match the VM's compiler (e.g., go 1.18) before running go mod tidy.
 
-Fix: Explicitly downgrade the version requirement in your go.mod file to match the VM's compiler before running go mod tidy:
+### 8. The Control Plane Implementation (main.go)
+Create the main.go file. This application parses the eBPF object, injects our baseline zero-trust policy into the kernel map, and attaches the enforcement program to the tracepoint. (The full implementation is available in the main.go file in the code repository).
 
-### 8. Bring the Shield Up
-Run the Control Plane. Because it manipulates kernel memory, it must be run with sudo.
+### 9. Bring the Shield Up
+Run the Control Plane. Because it manipulates kernel memory, it must be run with sudo privileges.
 
 Bash:
 
@@ -110,7 +108,7 @@ Note: The terminal will hang, indicating the eBPF engine is actively monitoring 
 ### 10. Simulating a Container Escape Attack
 To verify the zero-trust architecture, we simulate an attacker attempting to break out of a container. A common escape vector involves utilizing the clone system call with specific namespace flags (CLONE_NEWNET and CLONE_NEWPID).
 
-Open a second terminal window, SSH into the Vagrant VM, and create exploit.c:
+Open a second terminal window, SSH into the Vagrant VM, and create the exploit payload. (The full C source code for this payload is available in the exploit.c file in the code repository).
 
 ### 11. Monitor Kernel Telemetry (Trace Pipe)
 To prove the eBPF program is inspecting registers in real-time, open a third terminal window, SSH into the VM, and listen to the kernel's raw trace output. This will capture our bpf_printk statements.
