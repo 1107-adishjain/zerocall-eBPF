@@ -1,0 +1,39 @@
+name: build
+
+# Paper Section 6.10 — pinned LLVM/Clang toolchain in CI so the eBPF bytecode
+# the kernel verifier sees is always the one built here, never a dev's local
+# GCC/clang drift.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install eBPF toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang llvm libbpf-dev linux-tools-common gcc-multilib
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.21'
+
+      - name: Compile the eBPF data plane
+        # -O2 is required: the verifier rejects unoptimised bytecode (register spilling).
+        run: clang -O2 -g -target bpf -D__TARGET_ARCH_x86 -c zerocall.bpf.c -o zerocall.bpf.o
+
+      - name: Build the single-binary control plane (embeds zerocall.bpf.o)
+        run: go build -tags embedbpf -o zerocall .
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Build default (on-disk .o) variant
+        run: go build -o zerocall-disk .

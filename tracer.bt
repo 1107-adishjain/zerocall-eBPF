@@ -1,0 +1,29 @@
+#!/usr/bin/env bpftrace
+/*
+ * Phase 2 — Dynamic Workload Tracing (S_dynamic), paper Section 4.4.
+ *
+ * Hooks the raw syscall entry tracepoint and records, with microsecond
+ * accuracy, every distinct syscall number the traced workload issues under
+ * load. auditd's user-space ring buffers drop events under heavy traffic; a
+ * raw tracepoint in the kernel does not.
+ *
+ * Usage (run while the staging container is under ApacheBench / SysBench load):
+ *   sudo bpftrace tracer.bt -o dynamic_syscalls.log
+ *   # optionally scope to one command:
+ *   sudo bpftrace tracer.bt --comm nginx
+ *
+ * The @seen map keeps one entry per syscall id; the END block prints each once
+ * as "SYSCALL <id>", which dynamic.go parses into S_dynamic.
+ */
+
+tracepoint:raw_syscalls:sys_enter
+{
+    @seen[args->id] = count();
+}
+
+END
+{
+    printf("=== S_dynamic (unique syscall ids) ===\n");
+    print(@seen);
+    clear(@seen);
+}

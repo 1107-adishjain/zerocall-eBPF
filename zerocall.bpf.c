@@ -2,6 +2,42 @@
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_tracing.h>
 
+/*
+ * ZeroCall-eBPF data plane.
+ *
+ * A single raw tracepoint on sys_enter performs one O(1) hash-map lookup per
+ * system call and acts on a ternary policy:
+ *
+ *     0 = DENY    unconditional block (SIGKILL), no argument inspection
+ *     1 = ALLOW   native execution, fast path
+ *     2 = AUDIT   argument inspection (Algorithm 2); may block on arguments
+ *
+ * A syscall with no map entry is allowed (default-allow). The control plane
+ * (main.go) populates syscall_policy_map before attaching this program.
+ *
+ * Note: a raw tracepoint cannot alter a syscall's return value, so a blocked
+ * call is stopped with bpf_send_signal(SIGKILL) on the calling task rather
+ * than with -EPERM.
+ */
+
+/* All CLONE_NEW* namespace flags, OR-ed together. A container escape via
+ * clone()/unshare() sets one or more of these to build a fresh namespace. */
+#define CLONE_NS_MASK 0x7E020000UL
+/* First 8 bytes of "/bin/sh\0", little-endian. */
+#define BIN_SH_LE 0x0068732f6e69622fULL
+
+#define POLICY_DENY  0
+#define POLICY_ALLOW 1
+#define POLICY_AUDIT 2
+
+/* x86_64 syscall numbers handled by the argument inspector. */
+#define SYS_clone   56
+#define SYS_execve  59
+#define SYS_ptrace  101
+#define SYS_mount   165
+#define SYS_unshare 272
+#define SYS_bpf     321
+
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
     __uint(max_entries, 512);
@@ -11,148 +47,75 @@ struct {
 
 SEC("raw_tracepoint/sys_enter")
 int zero_trust_enforcer(struct bpf_raw_tracepoint_args *ctx) {
-    u32 syscall_id = ctx->args[1]; 
+    /* For sys_enter, args[0] is the pt_regs pointer and args[1] is the
+     * syscall number. */
+    u32 syscall_id = ctx->args[1];
     u32 *action = bpf_map_lookup_elem(&syscall_policy_map, &syscall_id);
 
-    if (!action) return 0; // Ignore unmapped syscalls for now
+    if (!action)
+        return 0; /* default-allow: not in policy */
 
-    if (*action == 0) {
-        bpf_printk("[BLOCK] Explicitly Denied Syscall: %d\n", syscall_id);
-        bpf_send_signal(9); 
+    if (*action == POLICY_DENY) {
+        bpf_printk("[BLOCK] Explicitly denied syscall: %d\n", syscall_id);
+        bpf_send_signal(9); /* SIGKILL */
         return 0;
-    } 
-    else if (*action == 1) {
-        return 0; // ALLOW: Fast path bypass
-    } 
-    else if (*action == 2) {
-        // AUDIT: Deep Argument Inspection
-        struct pt_regs *regs = (struct pt_regs *)ctx->args[0];
+    }
 
-        switch (syscall_id) {
-            case 56: { // clone
-                unsigned long clone_flags;
-                bpf_probe_read_kernel(&clone_flags, sizeof(clone_flags), &regs->di);
-                if ((clone_flags & 0x10000000) || (clone_flags & 0x20000000)) {
-                    bpf_printk("[BLOCK] Malicious clone() namespace escape!\n");
-                    bpf_send_signal(9);
-                }
-                break;
-            }
-            case 59: { // execve
-                const char *filename_ptr;
-                char filename[8];
-                
-                // Read the pointer to the filename string from the 'di' register
-                bpf_probe_read_kernel(&filename_ptr, sizeof(filename_ptr), &regs->di);
-                // Read the first 8 bytes of the actual string
-                bpf_probe_read_user_str(&filename, sizeof(filename), filename_ptr);
+    if (*action == POLICY_ALLOW)
+        return 0; /* fast path */
 
-                // High-speed comparison: Does it equal "/bin/sh\0" in hex?
-                // 0x0068732f6e69622f is little-endian for "/bin/sh"
-                if (*(unsigned long long *)filename == 0x0068732f6e69622f) {
-                    bpf_printk("[BLOCK] Illegal shell execution detected: /bin/sh\n");
-                    bpf_send_signal(9);
-                }
-                break;
-            }
-            case 101: { // ptrace
-                // Containers almost never need to debug other processes.
-                bpf_printk("[BLOCK] ptrace() injection attempt!\n");
-                bpf_send_signal(9);
-                break;
-            }
-            case 165: { // mount
-                // Containers shouldn't be mounting things at runtime.
-                bpf_printk("[BLOCK] Illegal mount() execution!\n");
-                bpf_send_signal(9);
-                break;
-            }
-            case 272: { // unshare
-                bpf_printk("[BLOCK] unshare() namespace detachment attempt!\n");
-                bpf_send_signal(9);
-                break;
-            }
-            case 321: { // bpf
-                bpf_printk("[BLOCK] Nested eBPF injection attempt blocked!\n");
-                bpf_send_signal(9);
-                break;
-            }
+    /* POLICY_AUDIT: Algorithm 2 — inspect arguments before deciding. */
+    struct pt_regs *regs = (struct pt_regs *)ctx->args[0];
+
+    switch (syscall_id) {
+    case SYS_clone: {
+        /* arg0 (rdi) = clone flags on x86_64. */
+        unsigned long clone_flags = 0;
+        bpf_probe_read_kernel(&clone_flags, sizeof(clone_flags), &regs->di);
+        if (clone_flags & CLONE_NS_MASK) {
+            bpf_printk("[BLOCK] Malicious clone() namespace escape! flags=%lx\n",
+                       clone_flags);
+            bpf_send_signal(9);
         }
+        break;
+    }
+    case SYS_execve: {
+        /* arg0 (rdi) = pointer to the program path. */
+        const char *filename_ptr = 0;
+        char filename[8] = {};
+        bpf_probe_read_kernel(&filename_ptr, sizeof(filename_ptr), &regs->di);
+        bpf_probe_read_user_str(&filename, sizeof(filename), filename_ptr);
+        if (*(unsigned long long *)filename == BIN_SH_LE) {
+            bpf_printk("[BLOCK] Illegal shell execution detected: /bin/sh\n");
+            bpf_send_signal(9);
+        }
+        break;
+    }
+    case SYS_ptrace:
+        bpf_printk("[BLOCK] ptrace() injection attempt!\n");
+        bpf_send_signal(9);
+        break;
+    case SYS_mount:
+        bpf_printk("[BLOCK] Illegal mount() execution!\n");
+        bpf_send_signal(9);
+        break;
+    case SYS_unshare: {
+        /* arg0 (rdi) = unshare flags; same namespace flags as clone(). */
+        unsigned long unshare_flags = 0;
+        bpf_probe_read_kernel(&unshare_flags, sizeof(unshare_flags), &regs->di);
+        if (unshare_flags & CLONE_NS_MASK) {
+            bpf_printk("[BLOCK] unshare() namespace detachment! flags=%lx\n",
+                       unshare_flags);
+            bpf_send_signal(9);
+        }
+        break;
+    }
+    case SYS_bpf:
+        bpf_printk("[BLOCK] Nested eBPF injection attempt blocked!\n");
+        bpf_send_signal(9);
+        break;
     }
     return 0;
 }
 
 char _license[] SEC("license") = "GPL";
-
-
-
-// ##old code:
-
-
-// #include "vmlinux.h"
-// #include <bpf/bpf_helpers.h>
-// #include <bpf/bpf_tracing.h>
-
-// // 1. Define the eBPF Hash Map (Our Policy Bridge)
-// struct {
-//     __uint(type, BPF_MAP_TYPE_HASH);
-//     __uint(max_entries, 512); // Enough for all Linux syscalls
-//     __type(key, u32);         // Syscall ID
-//     __type(value, u32);       // Action: 0=DENY, 1=ALLOW, 2=AUDIT
-// } syscall_policy_map SEC(".maps");
-
-// // 2. The eBPF Hook (Attaching to every system call entry)
-// SEC("raw_tracepoint/sys_enter")
-// int zero_trust_enforcer(struct bpf_raw_tracepoint_args *ctx) {
-//     // In a raw_tracepoint for sys_enter, ctx->args[1] holds the syscall ID
-//     u32 syscall_id = ctx->args[1]; 
-    
-//     // Look up the syscall ID in our map
-//     u32 *action = bpf_map_lookup_elem(&syscall_policy_map, &syscall_id);
-
-//     // ----------------------------------------------------
-//     // ENFORCEMENT LOGIC
-//     // ----------------------------------------------------
-
-//     // If the syscall isn't in our map, let it pass so our VM doesn't crash!
-//     if (!action) {
-//         return 0; 
-//     }
-
-//     if (*action == 0) {
-//         // EXPLICIT DENY
-//         bpf_printk("[SECURITY BLOCK] Denied syscall: %d\n", syscall_id);
-//         bpf_send_signal(9); // 9 is SIGKILL
-//         return 0;
-//     } 
-//     else if (*action == 1) {
-//         // EXPLICIT ALLOW
-//         return 0; 
-//     } 
-//     else if (*action == 2) {
-//         // AUDIT: Dangerous but necessary
-//         if (syscall_id == 56) { // 56 is the ID for 'clone' on x86_64
-//             // ctx->args[0] points to the CPU registers where the arguments are stored
-//             struct pt_regs *regs = (struct pt_regs *)ctx->args[0];
-//             unsigned long clone_flags;
-            
-//             // Read the first argument (flags) from the 'di' register safely
-//             bpf_probe_read_kernel(&clone_flags, sizeof(clone_flags), &regs->di);
-
-//             // Check for namespace container escape flags
-//             if ((clone_flags & 0x10000000) || (clone_flags & 0x20000000)) {
-//                 bpf_printk("[SECURITY BLOCK] Malicious clone() detected! Flags: %lx\n", clone_flags);
-//                 bpf_send_signal(9); 
-//                 return 0;
-//             }
-//             bpf_printk("[AUDIT PASS] Normal clone() allowed.\n");
-//             return 0;
-//         }
-//     }
-    
-//     // Catch-all return to satisfy the compiler for all other control paths
-//     return 0;
-// }
-
-// // Required license for kernel loading
-// char _license[] SEC("license") = "GPL";
